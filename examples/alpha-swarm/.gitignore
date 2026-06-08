@@ -1,0 +1,8 @@
+tmp/
+pending-messages/
+output/
+.swarmforge/
+__pycache__/
+*.pyc
+.env
+*.egg-info/

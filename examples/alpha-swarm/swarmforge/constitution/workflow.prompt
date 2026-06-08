@@ -1,0 +1,72 @@
+WORKFLOW CONSTITUTION — ALPHA SWARM
+
+─────────────────────────────────────────────────
+GIT & WORKTREE DISCIPLINE
+─────────────────────────────────────────────────
+- Each agent works in its designated worktree (see swarmforge.conf).
+- Never commit directly to another agent's worktree.
+- Before starting work: git pull --rebase origin <your-branch>.
+- After completing work: commit memo JSON + narrative, then send handoff.
+- Commit message format: "<role>(<ticker>): <one-line summary>"
+  Example: "analyst(MSFT): intrinsic value $380, moat 8/10, margin of safety 24%"
+
+─────────────────────────────────────────────────
+HANDOFF PROTOCOL
+─────────────────────────────────────────────────
+Handoff file path: ./tmp/<target-role>-handoff.txt
+Send via: ./swarmtools/notify-agent.sh <target-role> --file ./tmp/<target-role>-handoff.txt
+
+Mandatory handoff format:
+  Re-read your role and constitution.
+  Sender:           <role>
+  Target Ticker(s): <TICKER, TICKER, ...>
+  Thesis:           <one sentence>
+  Intrinsic Value:  $<XX.XX>  (null if not yet computed)
+  Current Price:    $<XX.XX>
+  Margin of Safety: <XX%>     (null if IV not computed)
+  Moat Score:       <X/10>    (null if not yet evaluated)
+  Risk Score:       <X/10>
+  Conviction:       <X/10>
+  Recommendation:   <PROCEED | HOLD_FOR_DATA | REJECT | VETO>
+  Memo File:        ./tmp/<ticker>-memo.json
+  Branch:           <branch-name>
+  Hash:             <commit-sha>
+
+─────────────────────────────────────────────────
+PIPELINE FLOW
+─────────────────────────────────────────────────
+Normal path:
+  screener → analyst → quant → devil → portfolio
+
+Rejection paths:
+  devil    → VETO     → screener  (thesis invalid, restart)
+  portfolio → REVISE  → analyst   (valuation needs rework)
+  portfolio → RESCREEN → screener (thesis needs rebuilding)
+
+─────────────────────────────────────────────────
+MESSAGE QUEUEING  (when agent is busy)
+─────────────────────────────────────────────────
+If you receive a handoff while already processing a task:
+  1. Save the incoming message to:
+     ./pending-messages/PP-YYYYMMDD-HHMMSS-<sender>.txt
+     where PP = priority (00 = urgent macro alert, 50 = normal handoff)
+  2. Continue current task to completion.
+  3. Send your handoff for the current task.
+  4. Process pending-messages/ in filename order (lowest PP first, then chronological).
+  5. Delete each file after processing.
+
+Priority rules:
+  00 : Systemic risk alerts (macro regime change, circuit breaker events)
+  50 : Normal pipeline handoffs
+  99 : Low priority / informational messages
+
+─────────────────────────────────────────────────
+CONVICTION SCORE DEFINITION
+─────────────────────────────────────────────────
+1–3  : Speculative — thesis has significant unresolved uncertainties
+4–5  : Moderate — thesis is sound but key risks remain
+6–7  : High — thesis is well-supported, risks are understood and bounded
+8–9  : Very high — exceptional business, significant margin of safety
+10   : Reserved for generational opportunities (rare, requires unanimous swarm agreement)
+
+Minimum conviction to proceed to Portfolio Manager: 5/10.

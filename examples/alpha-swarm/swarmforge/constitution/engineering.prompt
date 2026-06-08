@@ -1,0 +1,95 @@
+ENGINEERING CONSTITUTION — ALPHA SWARM
+
+─────────────────────────────────────────────────
+DATA SOURCES
+─────────────────────────────────────────────────
+Fundamentals:
+  - yfinance              : price, financials, balance sheet, cash flow (free tier)
+  - sec-edgar-api         : 10-K, 10-Q, 13F filings, insider transactions
+  - financial-modeling-prep (FMP) : historical metrics, DCF templates, peer comps
+  - simfin                : standardised income statements (free tier available)
+
+Macro:
+  - FRED API (St. Louis Fed) : interest rates, CPI, PCE, unemployment, M2
+  - BIS statistics           : global debt levels, credit-to-GDP gaps
+  - OECD.stat                : leading indicators, composite PMIs
+
+Sentiment / Positioning:
+  - SEC EDGAR 13F filings    : institutional positioning (quarterly)
+  - FINVIZ                   : short interest, insider trades
+  - AAII sentiment survey    : retail investor sentiment (contrarian signal)
+
+Alternative / Quality Checks:
+  - Quandl / Nasdaq Data Link : commodity prices, alternative datasets
+  - OpenCorporates            : corporate structure verification
+
+─────────────────────────────────────────────────
+ANALYSIS TOOLS  (Python stack)
+─────────────────────────────────────────────────
+tools/dcf_engine.py
+  - Two-stage DCF with dynamic WACC (bottom-up beta + ERP)
+  - Explicit forecast period: 5 years (conservative: analyst consensus −30%)
+  - Terminal growth rate: max(2.5%, GDP_long_term_estimate) — never exceed 3%
+  - Output: intrinsic_value, sensitivity_table (WACC ±1%, g ±0.5%)
+
+tools/factor_scorer.py
+  - VALUE    : composite(P/B, P/E, P/FCF, EV/EBITDA) → sector percentile
+  - QUALITY  : ROIC trend, gross margin trend, accruals ratio, leverage trend
+  - MOMENTUM : 12-1 month price return, earnings revision momentum (3m)
+  - LOW_VOL  : 3y Sharpe ratio, max drawdown, beta vs. benchmark
+  - Weights  : 40 / 30 / 20 / 10
+  - Output   : composite_score /100
+
+tools/beneish.py
+  - Beneish M-Score (8 variables): DSRI, GMI, AQI, SGI, DEPI, SGAI, LVGI, TATA
+  - Threshold: score > −1.78 → potential earnings manipulation → HARD REJECT
+
+tools/kelly.py
+  - Kelly fraction: f* = (p × b − q) / b
+    p = P(price reaches intrinsic value within 3 years), estimated by analyst
+    b = upside_to_IV / downside_to_bear_case
+  - Default: half-Kelly (f* / 2) for prudence
+  - Output: recommended_position_pct, max_position_pct (cap at 10%)
+
+tools/altman.py
+  - Altman Z-Score (Zones: > 2.99 safe, 1.23–2.99 grey, < 1.23 distress)
+  - Threshold: score < 1.23 → HARD REJECT
+
+─────────────────────────────────────────────────
+OUTPUT FORMAT — INVESTMENT MEMO
+─────────────────────────────────────────────────
+All agents produce machine-readable JSON + human narrative.
+JSON schema (saved to ./tmp/<ticker>-memo.json):
+{
+  "ticker":            string,
+  "date":              ISO8601,
+  "agent":             string,
+  "intrinsic_value":   float | null,
+  "current_price":     float | null,
+  "margin_of_safety":  float | null,
+  "moat_score":        int | null,
+  "management_grade":  string | null,
+  "factor_score":      int | null,
+  "kelly_fraction":    float | null,
+  "risk_score":        int | null,
+  "conviction":        int | null,
+  "scenarios": {
+    "bull":  float,
+    "base":  float,
+    "bear":  float
+  },
+  "bias_checklist":    object,
+  "red_flags":         array,
+  "recommendation":    string,
+  "verdict_narrative": string
+}
+
+─────────────────────────────────────────────────
+QUALITY GATES  (hard blocks on handoff)
+─────────────────────────────────────────────────
+  [ ] intrinsic_value is populated (no handoff without a number)
+  [ ] risk_score is populated
+  [ ] All three scenarios (bull / base / bear) are populated
+  [ ] All six bias checklist items are evaluated
+  [ ] recommendation field is set
+  [ ] Sources cited with timestamp for all financial data used
