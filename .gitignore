@@ -6,3 +6,7 @@
 swarmtools/
 logs/
 agent_context/
+__pycache__/
+*.pyc
+*.pyo
+.skillops_data/

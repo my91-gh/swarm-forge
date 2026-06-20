@@ -1,0 +1,33 @@
+{
+  "skill_id": "sk_example_001",
+  "name": "fetch_and_place_object",
+  "domain_type": "place_in_container",
+  "contract": {
+    "precondition": {
+      "object": "apple",
+      "destination": "fridge"
+    },
+    "operation": [
+      {"name": "Navigate", "args": ["apple"]},
+      {"name": "Grasp",    "args": ["apple"]},
+      {"name": "Navigate", "args": ["fridge"]},
+      {"name": "Place",    "args": ["apple", "fridge"]}
+    ],
+    "artifact": {
+      "object_in": "fridge"
+    },
+    "validator": [
+      "contains_action:Place",
+      "arg_in_plan:object"
+    ],
+    "failure_modes": [
+      "object_not_found",
+      "grasp_failure",
+      "destination_blocked"
+    ]
+  },
+  "is_synthetic": false,
+  "parent_skill_id": null,
+  "degradation_tag": null,
+  "metadata": {}
+}
