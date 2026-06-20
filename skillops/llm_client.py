@@ -1,33 +1,22 @@
-"""LLMClient: Anthropic Claude interface with budget controls and caching."""
+"""LLMClient: Claude CLI backend with disk cache and call logging.
+
+Calls `claude -p <prompt>` via subprocess so no ANTHROPIC_API_KEY is required —
+only a Claude subscription with the `claude` CLI installed and logged in.
+"""
 from __future__ import annotations
 
 import fcntl
 import hashlib
 import json
-import os
+import subprocess
 import time
-import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import anthropic
 
-# ---------------------------------------------------------------------------
-# Pricing table: USD per million tokens
-# ---------------------------------------------------------------------------
-
-PRICE_TABLE_USD_PER_MTOK: Dict[str, Dict[str, float]] = {
-    "claude-opus-4-8":   {"input": 5.00, "output": 25.00},
-    "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
-    "claude-haiku-4-5":  {"input": 1.00, "output":  5.00},
-    "stub-zero":         {"input": 0.00, "output":  0.00},
-}
-
-DEFAULT_MODEL = "claude-opus-4-8"
 _DATA_DIR = Path(".skillops_data")
-_HARD_CAP_USD = 100.0
-_WARN_USD = 80.0
+DEFAULT_MODEL = "cli"   # sentinel: means "whatever `claude` is logged in as"
 
 
 # ---------------------------------------------------------------------------
@@ -35,7 +24,7 @@ _WARN_USD = 80.0
 # ---------------------------------------------------------------------------
 
 class BudgetExceededError(RuntimeError):
-    """Raised when cumulative spend reaches or exceeds the hard cap."""
+    """Kept for API compatibility; never raised when using the CLI backend."""
 
 
 # ---------------------------------------------------------------------------
@@ -45,9 +34,9 @@ class BudgetExceededError(RuntimeError):
 @dataclass
 class LLMResponse:
     text: str
-    input_tokens: int
-    output_tokens: int
-    cost_usd: float
+    input_tokens: int   # always 0 — CLI does not expose token counts
+    output_tokens: int  # always 0
+    cost_usd: float     # always 0.0 — covered by subscription
     latency_ms: float
     cached: bool = False
     model: str = ""
@@ -85,187 +74,108 @@ class DiskCache:
 
 
 # ---------------------------------------------------------------------------
-# BudgetTracker
-# ---------------------------------------------------------------------------
-
-class BudgetTracker:
-    """File-locked JSON state tracking cumulative costs across processes."""
-
-    def __init__(self, state_path: Path) -> None:
-        self._path = state_path
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        if not self._path.exists():
-            self._path.write_text(json.dumps({"total_usd": 0.0, "calls": 0}))
-
-    def add(self, cost: float) -> float:
-        with open(self._path, "r+") as fh:
-            fcntl.flock(fh, fcntl.LOCK_EX)
-            state = json.load(fh)
-            state["total_usd"] = round(state.get("total_usd", 0.0) + cost, 6)
-            state["calls"] = state.get("calls", 0) + 1
-            fh.seek(0)
-            json.dump(state, fh)
-            fh.truncate()
-            total = state["total_usd"]
-            fcntl.flock(fh, fcntl.LOCK_UN)
-        return total
-
-    def total(self) -> float:
-        with open(self._path) as fh:
-            fcntl.flock(fh, fcntl.LOCK_SH)
-            val = json.load(fh).get("total_usd", 0.0)
-            fcntl.flock(fh, fcntl.LOCK_UN)
-        return val
-
-
-# ---------------------------------------------------------------------------
 # LLMClient
 # ---------------------------------------------------------------------------
 
 class LLMClient:
-    """Anthropic Claude client with budget controls, disk cache, and call logging.
+    """Claude CLI client with disk cache and call logging.
 
-    Deliberately minimal: no fallback providers, no automatic retries, no
-    SDK-side rate limiting. API errors are written to the call log and re-raised
-    so the caller can decide what to do.
+    Invokes `claude -p <prompt>` for each LLM call so no API key is needed.
+    Multi-turn messages are flattened into a single prompt; the system prompt
+    is prepended in an XML-style block that Claude naturally respects.
+
+    Parameters
+    ----------
+    model : str
+        Ignored — the CLI uses whichever model the logged-in session provides.
+        Accepted for interface compatibility; stored as ``self._model``.
+    data_dir : Path
+        Directory for the disk cache and call log.
+    use_cache : bool
+        Whether to cache responses by prompt hash (avoids re-calling the CLI
+        for identical inputs, e.g. during tests).
+    cli_binary : str
+        Name or path of the Claude CLI binary (default ``"claude"``).
+    timeout : int
+        Subprocess timeout in seconds (default 120).
     """
 
     def __init__(
         self,
-        api_key: Optional[str] = None,
         model: str = DEFAULT_MODEL,
         data_dir: Path = _DATA_DIR,
-        hard_cap_usd: float = _HARD_CAP_USD,
-        warn_usd: float = _WARN_USD,
         use_cache: bool = True,
+        cli_binary: str = "claude",
+        timeout: int = 120,
+        # kept for drop-in compatibility with the old API-based signature
+        api_key: Optional[str] = None,
+        hard_cap_usd: float = 0.0,
+        warn_usd: float = 0.0,
     ) -> None:
-        self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
         self._model = model
         self._data_dir = Path(data_dir)
         self._data_dir.mkdir(parents=True, exist_ok=True)
-        self._hard_cap = hard_cap_usd
-        self._warn = warn_usd
         self._use_cache = use_cache
+        self._cli = cli_binary
+        self._timeout = timeout
         self._cache = DiskCache(self._data_dir / "cache")
-        self._budget = BudgetTracker(self._data_dir / "budget_state.json")
         self._call_log = self._data_dir / "llm_calls.jsonl"
 
-    def _price(self, model: str, input_tok: int, output_tok: int) -> float:
-        rates = PRICE_TABLE_USD_PER_MTOK.get(model, {"input": 0.0, "output": 0.0})
-        return (input_tok * rates["input"] + output_tok * rates["output"]) / 1_000_000
+    # ------------------------------------------------------------------ #
+    #  Public API                                                          #
+    # ------------------------------------------------------------------ #
 
     def call(
         self,
         messages: List[Dict[str, Any]],
         system: Optional[str] = None,
-        max_tokens: int = 4096,
+        max_tokens: int = 4096,     # ignored by CLI; kept for compatibility
         model: Optional[str] = None,
-        temperature: float = 0.0,
+        temperature: float = 0.0,   # ignored by CLI; kept for compatibility
     ) -> LLMResponse:
-        model = model or self._model
+        prompt = self._flatten(system, messages)
 
-        if model == "stub-zero":
-            return LLMResponse(
-                text="[stub]", input_tokens=0, output_tokens=0,
-                cost_usd=0.0, latency_ms=0.0, cached=False, model=model,
-            )
-
-        total = self._budget.total()
-        if total >= self._hard_cap:
-            raise BudgetExceededError(
-                f"Budget hard cap ${self._hard_cap} reached (spent ${total:.4f})"
-            )
-        if total >= self._warn:
-            warnings.warn(
-                f"SkillOps LLM spend ${total:.4f} approaching cap ${self._hard_cap}",
-                stacklevel=2,
-            )
-
-        cache_payload: Dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
-        if system:
-            cache_payload["system"] = system
-
+        cache_payload: Dict[str, Any] = {"prompt": prompt}
         if self._use_cache:
-            cached_text = self._cache.get(cache_payload)
-            if cached_text is not None:
+            cached = self._cache.get(cache_payload)
+            if cached is not None:
                 resp = LLMResponse(
-                    text=cached_text,
+                    text=cached,
                     input_tokens=0, output_tokens=0, cost_usd=0.0,
-                    latency_ms=0.0, cached=True, model=model,
+                    latency_ms=0.0, cached=True, model=self._model,
                 )
-                self._log(model, messages, resp, 0.0, None)
+                self._log(resp, 0.0, None)
                 return resp
 
         t0 = time.time()
         try:
-            client = anthropic.Anthropic(api_key=self._api_key)
-            kwargs: Dict[str, Any] = dict(
-                model=model,
-                max_tokens=max_tokens,
-                messages=messages,
-                temperature=temperature,
+            result = subprocess.run(
+                [self._cli, "-p", prompt],
+                capture_output=True,
+                text=True,
+                timeout=self._timeout,
             )
-            if system:
-                kwargs["system"] = system
-
-            raw = client.messages.create(**kwargs)
-            text = raw.content[0].text
-            input_tok = raw.usage.input_tokens
-            output_tok = raw.usage.output_tokens
-            cost = self._price(model, input_tok, output_tok)
-            latency_ms = (time.time() - t0) * 1000.0
-
-            self._budget.add(cost)
-            if self._use_cache:
-                self._cache.set(cache_payload, text)
-
-            resp = LLMResponse(
-                text=text,
-                input_tokens=input_tok,
-                output_tokens=output_tok,
-                cost_usd=cost,
-                latency_ms=latency_ms,
-                cached=False,
-                model=model,
-            )
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"`{self._cli}` exited {result.returncode}: {result.stderr.strip()}"
+                )
+            text = result.stdout.strip()
         except Exception as exc:
             latency_ms = (time.time() - t0) * 1000.0
-            self._log(model, messages, None, latency_ms, str(exc))
+            self._log(None, latency_ms, str(exc))
             raise
 
-        self._log(model, messages, resp, resp.latency_ms, None)
-        return resp
+        latency_ms = (time.time() - t0) * 1000.0
+        if self._use_cache:
+            self._cache.set(cache_payload, text)
 
-    def _log(
-        self,
-        model: str,
-        messages: List[Dict[str, Any]],
-        resp: Optional[LLMResponse],
-        latency_ms: float,
-        error: Optional[str],
-    ) -> None:
-        entry: Dict[str, Any] = {
-            "ts": time.time(),
-            "model": model,
-            "n_messages": len(messages),
-            "latency_ms": round(latency_ms, 2),
-        }
-        if resp:
-            entry.update({
-                "input_tokens": resp.input_tokens,
-                "output_tokens": resp.output_tokens,
-                "cost_usd": resp.cost_usd,
-                "cached": resp.cached,
-            })
-        if error:
-            entry["error"] = error
-        with open(self._call_log, "a") as fh:
-            fh.write(json.dumps(entry) + "\n")
+        resp = LLMResponse(
+            text=text,
+            input_tokens=0, output_tokens=0, cost_usd=0.0,
+            latency_ms=latency_ms, cached=False, model=self._model,
+        )
+        self._log(resp, latency_ms, None)
+        return resp
 
     def count_tokens(
         self,
@@ -273,13 +183,43 @@ class LLMClient:
         system: Optional[str] = None,
         model: Optional[str] = None,
     ) -> int:
-        """Count tokens for a message list without making a full completion call."""
-        model = model or self._model
-        if model == "stub-zero":
-            return 0
-        client = anthropic.Anthropic(api_key=self._api_key)
-        kwargs: Dict[str, Any] = dict(model=model, messages=messages)
+        """Rough character-based estimate (CLI does not expose token counts)."""
+        prompt = self._flatten(system, messages)
+        return len(prompt) // 4   # ~4 chars per token
+
+    # ------------------------------------------------------------------ #
+    #  Helpers                                                             #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _flatten(system: Optional[str], messages: List[Dict[str, Any]]) -> str:
+        """Serialize system prompt + message list into a single string."""
+        parts: List[str] = []
         if system:
-            kwargs["system"] = system
-        result = client.messages.count_tokens(**kwargs)
-        return result.input_tokens
+            parts.append(f"<system>\n{system}\n</system>")
+        for m in messages:
+            role = m.get("role", "user")
+            content = str(m.get("content", ""))
+            if role == "user":
+                parts.append(content)
+            elif role == "assistant":
+                parts.append(f"[Assistant previous turn]:\n{content}")
+        return "\n\n".join(parts)
+
+    def _log(
+        self,
+        resp: Optional[LLMResponse],
+        latency_ms: float,
+        error: Optional[str],
+    ) -> None:
+        entry: Dict[str, Any] = {
+            "ts": time.time(),
+            "backend": "claude-cli",
+            "latency_ms": round(latency_ms, 2),
+        }
+        if resp:
+            entry["cached"] = resp.cached
+        if error:
+            entry["error"] = error
+        with open(self._call_log, "a") as fh:
+            fh.write(json.dumps(entry) + "\n")
